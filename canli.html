@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>runation canlı koşu</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#f2f2f7; --card:#fff; --fg:#1c1c1e; --muted:#6e6e73; --green:#2fa85a; --red:#ff3b30; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#000; --card:#1c1c1e; --fg:#f2f2f7; --muted:#a1a1a6; --green:#30d158; } }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  #map { position:fixed; inset:0; }
+  .panel { position:fixed; left:12px; right:12px; bottom:calc(12px + env(safe-area-inset-bottom)); max-width:520px; margin:0 auto; background:var(--card); border-radius:18px; padding:14px 16px; box-shadow:0 6px 24px rgba(0,0,0,.18); z-index:1000; }
+  .row { display:flex; align-items:center; gap:8px; }
+  .name { font-weight:700; font-size:17px; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .badge { font-size:12px; font-weight:800; letter-spacing:.5px; color:#fff; background:var(--red); border-radius:6px; padding:2px 7px; }
+  .badge.paused { background:#ff9f0a; } .badge.done { background:#8e8e93; }
+  .stats { display:flex; justify-content:space-between; margin-top:10px; }
+  .stat b { display:block; font-size:24px; font-variant-numeric:tabular-nums; }
+  .stat span { color:var(--muted); font-size:13px; }
+  .muted { color:var(--muted); font-size:13px; margin-top:8px; }
+  .dot { width:18px; height:18px; border-radius:50%; background:var(--green); border:3px solid #fff; box-shadow:0 0 0 6px rgba(48,209,88,.3); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <div class="row"><div class="name" id="name">runation</div><div class="badge" id="badge">…</div></div>
+  <div class="stats">
+    <div class="stat"><b id="dist">–</b><span>Mesafe (km)</span></div>
+    <div class="stat"><b id="time">–</b><span>Süre</span></div>
+    <div class="stat"><b id="pace">–</b><span>Tempo /km</span></div>
+  </div>
+  <div class="muted" id="note">Yükleniyor…</div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  // Kurulum: aşağıdaki iki değeri kendi Supabase projeninkilerle değiştir (KURULUM.md → Canlı konum paylaşımı).
+  // Yalnızca herkese açık (publishable) anahtar yazılır; gizli (secret) anahtar asla buraya konmaz.
+  const SUPABASE_URL = 'https://xzjiemgtjxnlnidyrcxo.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_mJPdbgpxXHrZa_gK-K42lg_4rgSHv5m';
+
+  const token = new URLSearchParams(location.search).get('t') || '';
+  const $ = (id) => document.getElementById(id);
+  const map = L.map('map', { zoomControl: false }).setView([39, 35], 5);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> katkıcıları',
+  }).addTo(map);
+  const line = L.polyline([], { color: '#30d158', weight: 5, opacity: 0.9 }).addTo(map);
+  const marker = L.marker([0, 0], { icon: L.divIcon({ className: '', html: '<div class="dot"></div>', iconSize: [18, 18], iconAnchor: [9, 9] }) });
+  let fitted = false;
+  let timer = null;
+
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmtTime = (s) => { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60; return h ? `${h}:${pad(m)}:${pad(x)}` : `${m}:${pad(x)}`; };
+  const fmtPace = (s, m) => { if (m < 50 || s <= 0) return '–'; const p = Math.round(s / (m / 1000)); return p > 3600 ? '–' : `${Math.floor(p / 60)}:${pad(p % 60)}`; };
+  const ago = (iso) => { const d = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000); return d < 60 ? 'az önce' : `${Math.round(d / 60)} dk önce`; };
+
+  async function load() {
+    if (!/^[0-9a-f]{64}$/.test(token)) { $('note').textContent = 'Bağlantı geçersiz.'; $('badge').textContent = '—'; return; }
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_live_session`, {
+        method: 'POST',
+        headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ p_token: token }),
+      });
+      const rows = await res.json();
+      const s = Array.isArray(rows) ? rows[0] : null;
+      if (!s) { $('note').textContent = 'Bu canlı paylaşım sona erdi ya da bulunamadı.'; $('badge').textContent = 'BİTTİ'; $('badge').className = 'badge done'; clearInterval(timer); return; }
+      $('name').textContent = s.full_name ? `${s.full_name} koşuyor` : `@${s.username} koşuyor`;
+      const status = s.status;
+      $('badge').textContent = status === 'running' ? 'CANLI' : status === 'paused' ? 'DURAKLATILDI' : 'BİTTİ';
+      $('badge').className = 'badge' + (status === 'paused' ? ' paused' : status === 'finished' ? ' done' : '');
+      $('dist').textContent = (s.distance_m / 1000).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      $('time').textContent = fmtTime(s.elapsed_s);
+      $('pace').textContent = fmtPace(s.elapsed_s, s.distance_m);
+      const pts = (s.path || []).map((p) => [Number(p[0]), Number(p[1])]);
+      line.setLatLngs(pts);
+      if (s.lat != null && s.lng != null) {
+        marker.setLatLng([s.lat, s.lng]).addTo(map);
+        if (!fitted) { map.setView([s.lat, s.lng], 15); fitted = true; } else if (status === 'running') map.panTo([s.lat, s.lng]);
+      } else {
+        map.removeLayer(marker);
+        if (!fitted && pts.length > 1) { map.fitBounds(line.getBounds(), { padding: [30, 30] }); fitted = true; }
+      }
+      $('note').textContent = status === 'finished'
+        ? 'Koşu bitti. Tebrikler!'
+        : `Son güncelleme ${ago(s.updated_at)}${s.lat == null ? ' · konum şu an gizli bölgede' : ''}`;
+      if (status === 'finished') clearInterval(timer);
+    } catch (e) {
+      $('note').textContent = 'Bağlantı kurulamadı, yeniden deneniyor…';
+    }
+  }
+  load();
+  timer = setInterval(load, 10000);
+</script>
+</body>
+</html>
